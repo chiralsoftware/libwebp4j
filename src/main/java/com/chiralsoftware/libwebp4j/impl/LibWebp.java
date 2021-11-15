@@ -105,6 +105,10 @@ public final class LibWebp {
         final Path path = Path.of(libraryPath);
 
         symbolLookup = SymbolLookup.loaderLookup();
+        // use the systemLookup instead, which should be able to find webp symbols
+        // without specifyin the full library path
+        // final Optional<MemoryAddress> oSymbolAddress = CLinker.systemLookup().lookup("strlen");
+        
 
         final CLinker cLinker = CLinker.getInstance();
 
