@@ -13,7 +13,6 @@ import java.awt.image.DataBufferByte;
 import java.awt.image.Raster;
 import java.awt.image.RenderedImage;
 import java.io.File;
-import java.io.FileOutputStream;
 import java.io.IOException;
 import java.io.OutputStream;
 import java.lang.invoke.MethodHandle;
@@ -21,8 +20,10 @@ import java.lang.invoke.MethodHandles;
 import static java.lang.invoke.MethodHandles.insertArguments;
 import java.lang.invoke.MethodType;
 import java.nio.ByteBuffer;
-import java.nio.channels.Channels;
+import java.nio.channels.FileChannel;
 import java.nio.channels.WritableByteChannel;
+import java.nio.file.Path;
+import java.nio.file.StandardOpenOption;
 import java.util.Arrays;
 import static java.util.logging.Level.WARNING;
 import java.util.logging.Logger;
@@ -32,6 +33,8 @@ import javax.imageio.ImageTypeSpecifier;
 import javax.imageio.ImageWriteParam;
 import javax.imageio.ImageWriter;
 import javax.imageio.metadata.IIOMetadata;
+import javax.imageio.stream.FileImageOutputStream;
+import javax.imageio.stream.ImageOutputStream;
 import jdk.incubator.foreign.CLinker;
 import static jdk.incubator.foreign.CLinker.C_INT;
 import static jdk.incubator.foreign.CLinker.C_POINTER;
@@ -76,6 +79,7 @@ public final class WebpImageWriter extends ImageWriter {
     }
 
     /** We are ignoring the ImageWriterParam for now */    
+    @Override
     public void write(IIOMetadata streamMetadata, IIOImage image, ImageWriteParam param) throws IOException {
         final RenderedImage renderedImage = image.getRenderedImage();
         LOG.info("the sample model is: " + renderedImage.getSampleModel() + 
@@ -116,12 +120,11 @@ public final class WebpImageWriter extends ImageWriter {
                     " banks, but this writer expects 1 bank");
         
         final byte[] bytes = dataBufferByte.getData();
-        // let's copy the bytes into a native segment
-        LOG.warning("we're copying byte arrays - fix this so we don't need to do that");
-        MemorySegment copied = MemorySegment.allocateNative(bytes.length, newImplicitScope());
+        // these bytes must be copied. Foreign code can't access heap memory:
+        // https://stackoverflow.com/questions/69521289/jep-412-pass-a-on-heap-byte-array-to-native-code-getting-unsupportedoperatione
+        final MemorySegment copied = MemorySegment.allocateNative(bytes.length, newImplicitScope());
         copied.asByteBuffer().put(bytes);
-        final MemorySegment configSegment = 
-                allocateNative(Config.Config, newImplicitScope());
+        final MemorySegment configSegment =  allocateNative(Config.Config, newImplicitScope());
         try {
             int result = (Integer) libWebp.ConfigInit.invoke(configSegment.address());
             if(result != 1) 
@@ -164,21 +167,37 @@ public final class WebpImageWriter extends ImageWriter {
                     renderedImage.getWidth() * sampleModel.getNumBands());
             LOG.info("ok we just did an invoke, result is: " + result);
             // now we should do an upcall !!!
-            final MethodHandle writerMH =
-                    MethodHandles.lookup().findStatic(WebpImageWriter.class, "myWriter", 
+
+            final MethodHandle writerBound;
+
+            if(getOutput() instanceof WritableByteChannel || getOutput() instanceof File || getOutput() instanceof Path) {
+                 final MethodHandle writerMH = MethodHandles.lookup().findStatic(WebpImageWriter.class, "myChannelWriter", 
                             MethodType.methodType(int.class, 
                                     WritableByteChannel.class, MemoryAddress.class, int.class, MemoryAddress.class));
-            // let's bind a parameter to this handle!
-            final File testFile = new File("/tmp/test-out.webp");
-            testFile.delete();
-            final OutputStream os = new FileOutputStream(testFile);
-            final WritableByteChannel channel = Channels.newChannel(os);
-            final MethodHandle writerBound = insertArguments(writerMH, 0, channel);
+                 writerBound = insertArguments(writerMH, 0, getOutputAsChannel());
+                 LOG.info("got a writer bound - channel writer");
+            } else if(getOutput() instanceof OutputStream os) {
+                 final MethodHandle writerMH = MethodHandles.lookup().findStatic(WebpImageWriter.class, "myOutputStreamWriter", 
+                            MethodType.methodType(int.class, 
+                                    OutputStream.class, MemoryAddress.class, int.class, MemoryAddress.class));
+                 writerBound = insertArguments(writerMH, 0, os);
+                 LOG.info("got a writer bound - OutputStreamWriter");
+            } else if(getOutput() instanceof ImageOutputStream ios) {
+                 final MethodHandle writerMH = MethodHandles.lookup().findStatic(WebpImageWriter.class, 
+                         "myImageOutputStreamWriter", 
+                            MethodType.methodType(int.class, 
+                                    ImageOutputStream.class, MemoryAddress.class, int.class, MemoryAddress.class));
+                 writerBound = insertArguments(writerMH, 0, ios);
+                 LOG.info("got a writer bound - ImageOutputStreamwriter");
+            } else {
+                throw new IOException("the output class was: " + getOutput().getClass() + " is not supported.");
+            }
+
             final MemoryAddress writerFunctionAddress =
                     CLinker.getInstance().upcallStub(writerBound, 
                             FunctionDescriptor.of(C_INT, C_POINTER, C_INT, C_POINTER), newImplicitScope());
             picture.setWriter(writerFunctionAddress.toRawLongValue());
-            LOG.info("I set the writer, now time for encoding fun!");
+            LOG.info("about to envoke the encoder!!!");
             result = (Integer) libWebp.Encode.invoke(configSegment.address(), pictureSegment.address());
             LOG.info("Ok, what just happened? " + result);
         } catch(Throwable t) {
@@ -186,9 +205,24 @@ public final class WebpImageWriter extends ImageWriter {
         }
     }
     
+    private WritableByteChannel getOutputAsChannel() throws IOException {
+        final Object output = getOutput();
+        if(output == null) throw new IOException("setOutput(output) has not been called so this can't write.");
+        if(output instanceof WritableByteChannel wbc) return wbc;
+        if(output instanceof File f) return FileChannel.open(f.toPath(), StandardOpenOption.READ);
+        if(output  instanceof  Path p) return FileChannel.open(p, StandardOpenOption.READ);
+        if(output instanceof OutputStream ios) {
+            throw new IOException("Don't use the getOutputAsChannel method with an OutputStream");
+        }
+        if(output instanceof ImageOutputStream) {
+            throw new IOException("don't use getOutputAsChannel method witn an ImageOutputStream");
+        }
+        throw new IOException("this output type: " + output.getClass() + " is not supported as a channel");
+    }
+    
     /** This can be static because we can bind any object necessary to the outputChannel
-     parameter */
-    public static int myWriter(WritableByteChannel channel, MemoryAddress data, int dataSize, MemoryAddress picturePointer) {
+     parameter. That is something very cool about MethodHandles  */
+    public static int myChannelWriter(WritableByteChannel channel, MemoryAddress data, int dataSize, MemoryAddress picturePointer) {
         final MemorySegment dataSegment = data.asSegment(dataSize, newImplicitScope());
         final ByteBuffer byteBuffer = dataSegment.asByteBuffer();
         try {
@@ -200,11 +234,46 @@ public final class WebpImageWriter extends ImageWriter {
         return 1; // write is always successful so far
     }
     
-    @Override
-    public void setOutput(Object object) {
-        super.setOutput(output);
-        LOG.info("Need to output to this object: " + object);
+    /** This is exactly like the OutputStreamWriter but the ImageOutputStream class
+     doesn't implement OutputStream, so... */
+    public static int myImageOutputStreamWriter(ImageOutputStream ios, 
+            MemoryAddress data, int dataSize, MemoryAddress picturePointer) throws IOException {
+        final MemorySegment dataSegment = data.asSegment(dataSize, newImplicitScope());
+        final ByteBuffer byteBuffer = dataSegment.asByteBuffer();
+        if(byteBuffer.hasArray()) {
+            try { 
+                ios.write(byteBuffer.array());
+            } catch(IOException ioe ) {
+                LOG.log(WARNING, "caught", ioe);
+                return 0;
+            }
+            return 1;
+        }
+        // otherwise... we need to copy the bytes out
+        final byte[] buf = new byte[byteBuffer.remaining()];
+        try {
+            byteBuffer.get(buf);
+            ios.write(buf);
+        } catch(IOException ioe) {
+            LOG.log(WARNING, "caught", ioe);
+            return 0;
+        }
+        return 1;
+    }
+    
+    /** Like the above, but specifically work with the ImageOutputStream. */
+    public static int myOutputStreamWriter(OutputStream os, 
+            MemoryAddress data, int dataSize, MemoryAddress picturePointer) {
         
+        final MemorySegment dataSegment = data.asSegment(dataSize, newImplicitScope());
+        final ByteBuffer byteBuffer = dataSegment.asByteBuffer();
+        try {
+            os.write(byteBuffer.array());
+        } catch(IOException ioe ) {
+            LOG.log(WARNING, "caught", ioe);
+            return 0;
+        }
+        return 1;
     }
     
 }

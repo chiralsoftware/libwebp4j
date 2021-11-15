@@ -201,6 +201,7 @@ public final class LibWebp {
         Encode = loadMethodHandle(cLinker, symbolLookup, "WebPEncode", 
                 MethodType.methodType(int.class, MemoryAddress.class, MemoryAddress.class),
                 FunctionDescriptor.of(C_INT, C_POINTER, C_POINTER));
+        LOG.info("All the methods have been loaded.");
         
     }
 

@@ -5,10 +5,14 @@ import java.awt.image.BufferedImage;
 import java.awt.image.DataBuffer;
 import java.awt.image.DataBufferByte;
 import java.awt.image.WritableRaster;
+import java.io.FileInputStream;
 import java.io.IOException;
-import java.nio.ByteBuffer;
+import java.nio.MappedByteBuffer;
+import java.nio.channels.FileChannel;
+import java.nio.channels.FileChannel.MapMode;
 import java.util.Iterator;
 import java.util.List;
+import static java.util.logging.Level.INFO;
 import static java.util.logging.Level.WARNING;
 import java.util.logging.Logger;
 import javax.imageio.ImageReadParam;
@@ -16,9 +20,9 @@ import javax.imageio.ImageReader;
 import javax.imageio.ImageTypeSpecifier;
 import javax.imageio.metadata.IIOMetadata;
 import javax.imageio.spi.ImageReaderSpi;
+import javax.imageio.stream.FileImageInputStream;
 import static jdk.incubator.foreign.CLinker.C_INT;
 import jdk.incubator.foreign.MemoryAccess;
-import static jdk.incubator.foreign.MemoryHandles.varHandle;
 import jdk.incubator.foreign.MemoryLayout;
 import jdk.incubator.foreign.MemorySegment;
 import static jdk.incubator.foreign.MemorySegment.allocateNative;
@@ -126,7 +130,7 @@ public final class WebpImageReader extends ImageReader {
             throw new IndexOutOfBoundsException("image index must be 0; it was: " + imageIndex);
         
         if(inputSegment == null) 
-            throw new NullPointerException("Input stream was null!");
+            throw new NullPointerException("inputSegment was null! was setInput called?");
         readHeader();
         LOG.info("Ok i read the header; size is: " + width  + ", " + height);
         final MemorySegment outputSegment = MemorySegment.allocateNative(width * height * 4, newImplicitScope());
@@ -158,10 +162,50 @@ public final class WebpImageReader extends ImageReader {
         }
         return bufferedImage;
     }
+    
+    @Override
+    public void setInput(Object input) {
+        LOG.info("I got called with an input object: " + input.getClass().getName());
+    }
+    
+    @Override
+    public void setInput(Object input, boolean seekForwardOnly, boolean ignoreMetadata) {
+        super.setInput(input, seekForwardOnly, ignoreMetadata);
+        LOG.info("I got called, with ignoreMetaData = " + ignoreMetadata);
+        if(input == null) throw new NullPointerException("can't set input to null; call dispose() if you wnat to dispose this.");
+        if(inputSegment != null) 
+            throw new IllegalStateException("call dispose() first!");
+        
+        if (input instanceof byte[] ba) {
+            inputSegment = MemorySegment.ofArray(ba);
+            return;
+        }
+        if(input instanceof FileInputStream fis) {
+            // map this into memory to avoid copying
+            final FileChannel fc = fis.getChannel();
+            try {
+                final MappedByteBuffer mappedByteBuffer = fc.map(MapMode.READ_ONLY, 0, fc.size());
+                inputSegment = MemorySegment.ofByteBuffer(mappedByteBuffer);
+            } catch (IOException ex) {
+                LOG.log(INFO, "couldn't map file", ex);
+            }
+        }
+        if(input instanceof FileImageInputStream fiis) {
+            LOG.info("got a FileImageInputStream it is of type: " + fiis.getClass().getName());
+            // unfortunately this is very inefficient - we have to load
+            // the whole thing into a byte array
+            final byte[] ba = new byte[(int)fiis.length()];
+            inputSegment = MemorySegment.ofArray(ba);
+            return;
+        }
+        
+        throw new IllegalArgumentException("Unknown input type: " + input.getClass().getName());
+    }
 
     @Override
     public void setInput(Object input, boolean isStreamable) {
         super.setInput(input, isStreamable);
+        LOG.finest("calling set input with this input object: " + input.getClass().getName());
         if(input == null) throw new NullPointerException("can't set input to null; call dispose() if you wnat to dispose this.");
         if(inputSegment != null) 
             throw new IllegalStateException("call dispose() first!");
@@ -175,6 +219,16 @@ public final class WebpImageReader extends ImageReader {
 //            bb.put(ba);
 
             return;
+        }
+        if(input instanceof FileInputStream fiis) {
+            // map this into memory to avoid copying
+            final FileChannel fc = fiis.getChannel();
+            try {
+                final MappedByteBuffer mappedByteBuffer = fc.map(MapMode.READ_ONLY, 0, fc.size());
+                inputSegment = MemorySegment.ofByteBuffer(mappedByteBuffer);
+            } catch (IOException ex) {
+                LOG.log(INFO, "couldn't map file", ex);
+            }
         }
         
         throw new IllegalArgumentException("Unknown input type: " + input.getClass().getName());
